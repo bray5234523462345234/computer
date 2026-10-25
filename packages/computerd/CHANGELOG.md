@@ -1,0 +1,95 @@
+# @cloudflare/computerd
+
+## 0.7.0
+
+### Patch Changes
+
+- [#269](https://github.com/cloudflare/computer/pull/269) Build the computerd binary on Node 22.23.4, whose bundled root store no longer trusts the emSign ECC Root CA - G3 and AAA Certificate Services roots behind the compromised eMudhra intermediates. ([`3186a02`](https://github.com/cloudflare/computer/commit/3186a0268437c9f5406d8b743c262cbc5223884d)) - Thanks [@aron-cf](https://github.com/aron-cf)
+
+- [#260](https://github.com/cloudflare/computer/pull/260) `computerd` no longer exits when a command's output arrives after the command has exited. ([`c3d7433`](https://github.com/cloudflare/computer/commit/c3d7433febb4daf5560c81e76bfe7f7bcef8679f)) - Thanks [@aron-cf](https://github.com/aron-cf)
+
+- Updated dependencies []:
+  - @cloudflare/dofs@0.7.0
+  - @cloudflare/computer-rpc@0.7.0
+
+## 0.6.0
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @cloudflare/dofs@0.6.0
+  - @cloudflare/computer-rpc@0.6.0
+
+## 0.5.1
+
+### Patch Changes
+
+- Updated dependencies [[`f1ac4ce`](https://github.com/cloudflare/computer/commit/f1ac4ce9f244cefd81615dabb33a1ca728dba30d), [`f1ac4ce`](https://github.com/cloudflare/computer/commit/f1ac4ce9f244cefd81615dabb33a1ca728dba30d), [`b663993`](https://github.com/cloudflare/computer/commit/b66399391cbadf55308affc9ed3e6098ccc09a41), [`50a80cc`](https://github.com/cloudflare/computer/commit/50a80cc3847f0b043df7750725d000a31de5147a)]:
+  - @cloudflare/dofs@0.5.1
+  - @cloudflare/computer-rpc@0.5.1
+
+## 0.5.0
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @cloudflare/dofs@0.5.0
+  - @cloudflare/computer-rpc@0.5.0
+
+## 0.4.1
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @cloudflare/dofs@0.4.1
+  - @cloudflare/computer-rpc@0.4.1
+
+## 0.4.0
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @cloudflare/dofs@0.4.0
+  - @cloudflare/computer-rpc@0.4.0
+
+## 0.3.2
+
+### Patch Changes
+
+- Updated dependencies [[`e5e28a7`](https://github.com/cloudflare/computer/commit/e5e28a79d74f1e173006193bf3eeb0d990c98930)]:
+  - @cloudflare/dofs@0.3.2
+  - @cloudflare/computer-rpc@0.3.2
+
+## 0.3.1
+
+### Patch Changes
+
+- [#139](https://github.com/cloudflare/computer/pull/139) The exec runner now takes an optional shell parameter. ([`5f310b6`](https://github.com/cloudflare/computer/commit/5f310b69421d334dfd3791216ca0a6a704a36efa)) - Thanks [@aron-cf](https://github.com/aron-cf)
+
+- Updated dependencies [[`7ce8259`](https://github.com/cloudflare/computer/commit/7ce8259324d40d32e7b2db9d371ea5b19f4c8f63), [`e6a92c5`](https://github.com/cloudflare/computer/commit/e6a92c50cb53997bd601bdce0563b96276d0f8fc), [`e6a92c5`](https://github.com/cloudflare/computer/commit/e6a92c50cb53997bd601bdce0563b96276d0f8fc), [`e6a92c5`](https://github.com/cloudflare/computer/commit/e6a92c50cb53997bd601bdce0563b96276d0f8fc), [`ef8cd11`](https://github.com/cloudflare/computer/commit/ef8cd11040b222875f1d04e7cfd6553068e07bb7)]:
+  - @cloudflare/dofs@0.3.1
+  - @cloudflare/computer-rpc@0.3.1
+
+## 0.3.0
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @cloudflare/dofs@0.3.0
+  - @cloudflare/computer-rpc@0.3.0
+
+## 0.2.1
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @cloudflare/dofs@0.2.1
+  - @cloudflare/computer-rpc@0.2.1
+
+## 0.2.0
+
+### Patch Changes
+
+- Updated dependencies [[`eda0ddc`](https://github.com/cloudflare/computer/commit/eda0ddc3769fe59eec0b64dc8cb163af54ae869e), [`adbf497`](https://github.com/cloudflare/computer/commit/adbf4978e14769a7bb452d692260c76032ec42b8), [`8758b51`](https://github.com/cloudflare/computer/commit/8758b51c8891c211dddd1903d2ee2d12a75ac7ff), [`5062158`](https://github.com/cloudflare/computer/commit/50621582410c8933d313eddf8fb362596ffd9d29)]:
+  - @cloudflare/dofs@0.2.0
+  - @cloudflare/computer-rpc@0.2.0

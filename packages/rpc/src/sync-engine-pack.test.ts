@@ -1,0 +1,642 @@
+import {
+  currentRev,
+  Database,
+  initializeSchema,
+  readFetchCursor,
+  readOperation,
+  readPushCursor,
+  SQLiteWorkspaceProvider,
+} from "@cloudflare/dofs";
+import { SQLiteTestStorage } from "@cloudflare/dofs/testing";
+import { describe, expect, it } from "vitest";
+
+import type { SyncRPC } from "./interface.js";
+import { createSyncServer } from "./server.js";
+import { reconcileWatermarks } from "./sync-driver.js";
+import { pullBlocks, pushBlocks, type SyncProgress } from "./sync-engine.js";
+
+// Pack mode is the bulk path. These tests force the mode thresholds
+// down rather than materialising 20,000 files, then assert the two
+// things that distinguish pack from entry mode: the transport actually
+// used a pack, and convergence is identical either way.
+
+function makePeer(): { db: Database; rpc: SyncRPC; close: () => void } {
+  const storage = new SQLiteTestStorage();
+  const db = new Database(storage);
+  initializeSchema(db, () => 1000);
+  const rpc = createSyncServer(db);
+  return { db, rpc, close: () => storage.close() };
+}
+
+function seed(db: Database, count: number, bytes = 16): void {
+  const provider = new SQLiteWorkspaceProvider(db);
+  for (let i = 0; i < count; i++) {
+    const filler = String.fromCharCode(97 + (i % 26)).repeat(Math.max(1, bytes - 1));
+    provider.writeFileSync(`/f${String(i).padStart(3, "0")}.txt`, `${i}${filler}`);
+  }
+}
+
+function names(db: Database): string[] {
+  return db
+    .all<{ name: string }>("SELECT name FROM vfs_dirents WHERE parent_inode = 1 ORDER BY name")
+    .map((r) => r.name);
+}
+
+// Force pack selection at a low entry count.
+const PACK_OPTIONS = { thresholdEntries: 3, thresholdBytes: 1024 * 1024 * 1024 };
+
+async function drain(iterable: AsyncIterable<SyncProgress>, limit = 200): Promise<SyncProgress[]> {
+  const seen: SyncProgress[] = [];
+  for await (const progress of iterable) {
+    seen.push(progress);
+    if (seen.length > limit) throw new Error("sync did not terminate");
+  }
+  return seen;
+}
+
+describe("pack mode pull", () => {
+  it("selects pack mode once the window crosses the entry threshold", async () => {
+    const local = makePeer();
+    const remote = makePeer();
+    try {
+      seed(remote.db, 6);
+
+      const seen = await drain(pullBlocks(local.db, remote.rpc, PACK_OPTIONS));
+
+      expect(seen[0].mode).toBe("pack");
+      expect(seen[seen.length - 1].complete).toBe(true);
+    } finally {
+      local.close();
+      remote.close();
+    }
+  });
+
+  it("stays in entry mode below the threshold", async () => {
+    const local = makePeer();
+    const remote = makePeer();
+    try {
+      seed(remote.db, 2);
+
+      const seen = await drain(pullBlocks(local.db, remote.rpc, PACK_OPTIONS));
+
+      expect(seen[0].mode).toBe("entries");
+    } finally {
+      local.close();
+      remote.close();
+    }
+  });
+
+  it("converges through a pack exactly as entry mode would", async () => {
+    const local = makePeer();
+    const remote = makePeer();
+    try {
+      seed(remote.db, 6);
+
+      await drain(pullBlocks(local.db, remote.rpc, PACK_OPTIONS));
+
+      expect(names(local.db)).toEqual([
+        "f000.txt",
+        "f001.txt",
+        "f002.txt",
+        "f003.txt",
+        "f004.txt",
+        "f005.txt",
+      ]);
+    } finally {
+      local.close();
+      remote.close();
+    }
+  });
+
+  it("transfers file content through the pack", async () => {
+    const local = makePeer();
+    const remote = makePeer();
+    try {
+      seed(remote.db, 5);
+
+      await drain(pullBlocks(local.db, remote.rpc, PACK_OPTIONS));
+
+      const provider = new SQLiteWorkspaceProvider(local.db);
+      expect(provider.readFileSync("/f000.txt", "utf8")).toBe(`0${"a".repeat(15)}`);
+      expect(provider.readFileSync("/f004.txt", "utf8")).toBe(`4${"e".repeat(15)}`);
+    } finally {
+      local.close();
+      remote.close();
+    }
+  });
+
+  it("splits a pack operation across blocks and still converges", async () => {
+    const local = makePeer();
+    const remote = makePeer();
+    try {
+      seed(remote.db, 8);
+
+      const seen = await drain(
+        pullBlocks(local.db, remote.rpc, {
+          ...PACK_OPTIONS,
+          profile: { maxEntries: 3, maxBytes: 64 * 1024 * 1024 },
+        }),
+      );
+
+      expect(seen.length).toBeGreaterThanOrEqual(3);
+      expect(seen.every((p) => p.mode === "pack")).toBe(true);
+      expect(names(local.db)).toHaveLength(8);
+    } finally {
+      local.close();
+      remote.close();
+    }
+  });
+
+  it("resumes a pack operation in a fresh iterable after every block", async () => {
+    const local = makePeer();
+    const remote = makePeer();
+    try {
+      seed(remote.db, 8);
+      const options = {
+        ...PACK_OPTIONS,
+        profile: { maxEntries: 3, maxBytes: 64 * 1024 * 1024 },
+      };
+
+      for (let i = 0; i < 20; i++) {
+        const iterator = pullBlocks(local.db, remote.rpc, options)[Symbol.asyncIterator]();
+        const { value, done } = await iterator.next();
+        if (done || value.complete) break;
+      }
+
+      expect(names(local.db)).toHaveLength(8);
+    } finally {
+      local.close();
+      remote.close();
+    }
+  });
+
+  it("keeps the mode fixed for the life of an operation", async () => {
+    const local = makePeer();
+    const remote = makePeer();
+    try {
+      seed(remote.db, 8);
+      const options = {
+        ...PACK_OPTIONS,
+        profile: { maxEntries: 3, maxBytes: 64 * 1024 * 1024 },
+      };
+
+      const iterator = pullBlocks(local.db, remote.rpc, options)[Symbol.asyncIterator]();
+      const first = await iterator.next();
+      expect(first.value.mode).toBe("pack");
+      // The persisted operation records the mode, so a resumed
+      // iterator cannot silently switch encodings mid-operation.
+      expect(readOperation(local.db, "default", "pull")?.mode).toBe("pack");
+    } finally {
+      local.close();
+      remote.close();
+    }
+  });
+
+  it("deduplicates shared content across the pack", async () => {
+    const local = makePeer();
+    const remote = makePeer();
+    try {
+      const provider = new SQLiteWorkspaceProvider(remote.db);
+      for (let i = 0; i < 6; i++) {
+        provider.writeFileSync(`/same${i}.txt`, "identical content everywhere");
+      }
+
+      await drain(pullBlocks(local.db, remote.rpc, PACK_OPTIONS));
+
+      expect(names(local.db)).toHaveLength(6);
+      // One unique object backs all six paths.
+      const blobs = local.db.one<{ c: number }>("SELECT COUNT(*) AS c FROM vfs_blobs")?.c ?? 0;
+      expect(blobs).toBe(1);
+    } finally {
+      local.close();
+      remote.close();
+    }
+  });
+
+  it("applies deletions carried in a pack", async () => {
+    const local = makePeer();
+    const remote = makePeer();
+    try {
+      seed(remote.db, 6);
+      await drain(pullBlocks(local.db, remote.rpc, PACK_OPTIONS));
+
+      const provider = new SQLiteWorkspaceProvider(remote.db);
+      provider.unlinkSync("/f000.txt");
+      provider.unlinkSync("/f001.txt");
+      provider.unlinkSync("/f002.txt");
+      provider.unlinkSync("/f003.txt");
+      await drain(pullBlocks(local.db, remote.rpc, PACK_OPTIONS));
+
+      expect(names(local.db)).toEqual(["f004.txt", "f005.txt"]);
+    } finally {
+      local.close();
+      remote.close();
+    }
+  });
+
+  it("surfaces a corrupt pack as a protocol error without advancing", async () => {
+    const local = makePeer();
+    const remote = makePeer();
+    try {
+      seed(remote.db, 6);
+
+      // Truncate the pack stream mid-flight.
+      const corrupting = new Proxy(remote.rpc as object, {
+        get(target, prop, receiver) {
+          if (prop === "fetchChangePack") {
+            return async (...args: unknown[]) => {
+              const real = (await (
+                Reflect.get(target, prop, receiver) as (...a: unknown[]) => Promise<{
+                  stream: ReadableStream<Uint8Array>;
+                  cursor: unknown;
+                }>
+              ).call(target, ...args)) as { stream: ReadableStream<Uint8Array>; cursor: unknown };
+              const reader = real.stream.getReader();
+              const truncated = new ReadableStream<Uint8Array>({
+                async pull(controller) {
+                  const { value, done } = await reader.read();
+                  if (done) {
+                    controller.close();
+                    return;
+                  }
+                  // Emit a mangled first chunk and stop.
+                  const broken = new Uint8Array(value.slice(0, Math.max(1, value.length >> 1)));
+                  controller.enqueue(broken);
+                  controller.close();
+                },
+              });
+              return { ...real, stream: truncated };
+            };
+          }
+          return Reflect.get(target, prop, receiver);
+        },
+      }) as SyncRPC;
+
+      const iterator = pullBlocks(local.db, corrupting, PACK_OPTIONS)[Symbol.asyncIterator]();
+      await expect(iterator.next()).rejects.toThrow(/pack/i);
+
+      // Nothing applied, cursor untouched.
+      expect(names(local.db)).toEqual([]);
+    } finally {
+      local.close();
+      remote.close();
+    }
+  });
+});
+
+describe("pack mode push", () => {
+  it("ships a large local window as a pack and converges", async () => {
+    const local = makePeer();
+    const remote = makePeer();
+    try {
+      seed(local.db, 6);
+
+      const seen = await drain(pushBlocks(local.db, remote.rpc, PACK_OPTIONS));
+
+      expect(seen[0].mode).toBe("pack");
+      expect(names(remote.db)).toHaveLength(6);
+    } finally {
+      local.close();
+      remote.close();
+    }
+  });
+
+  it("transfers content correctly through a pushed pack", async () => {
+    const local = makePeer();
+    const remote = makePeer();
+    try {
+      seed(local.db, 5);
+
+      await drain(pushBlocks(local.db, remote.rpc, PACK_OPTIONS));
+
+      const provider = new SQLiteWorkspaceProvider(remote.db);
+      expect(provider.readFileSync("/f003.txt", "utf8")).toBe(`3${"d".repeat(15)}`);
+    } finally {
+      local.close();
+      remote.close();
+    }
+  });
+
+  it("resumes a pushed pack across blocks", async () => {
+    const local = makePeer();
+    const remote = makePeer();
+    try {
+      seed(local.db, 8);
+      const options = {
+        ...PACK_OPTIONS,
+        profile: { maxEntries: 3, maxBytes: 64 * 1024 * 1024 },
+      };
+
+      for (let i = 0; i < 20; i++) {
+        const iterator = pushBlocks(local.db, remote.rpc, options)[Symbol.asyncIterator]();
+        const { value, done } = await iterator.next();
+        if (done || value.complete) break;
+      }
+
+      expect(names(remote.db)).toHaveLength(8);
+    } finally {
+      local.close();
+      remote.close();
+    }
+  });
+
+  // A pre-command push carries exactly the large window that selects
+  // pack mode, and on a shim backend the spawned command reads from
+  // disk rather than the VFS. If the pack receiver skips the settle
+  // hook the command sees stale contents, so the hook has to fire on
+  // both transports.
+  it("settles the receiver's shim after a pack push", async () => {
+    const local = makePeer();
+    const storage = new SQLiteTestStorage();
+    const remoteDb = new Database(storage);
+    initializeSchema(remoteDb, () => 1000);
+    let calls = 0;
+    let namesAtHook: string[] = [];
+    const remoteRpc = createSyncServer(remoteDb, {
+      afterApply: () => {
+        calls += 1;
+        namesAtHook = names(remoteDb);
+      },
+    });
+    try {
+      seed(local.db, 8);
+      await drain(pushBlocks(local.db, remoteRpc, PACK_OPTIONS));
+
+      expect(calls).toBeGreaterThan(0);
+      // The entries must already be committed when the hook runs,
+      // mirroring the entry-mode guarantee.
+      expect(namesAtHook.length).toBeGreaterThan(0);
+      expect(names(remoteDb)).toHaveLength(8);
+    } finally {
+      local.close();
+      storage.close();
+    }
+  });
+
+  it("fails a pack push whose settle rejects, leaving the block unretired", async () => {
+    const local = makePeer();
+    const storage = new SQLiteTestStorage();
+    const remoteDb = new Database(storage);
+    initializeSchema(remoteDb, () => 1000);
+    let fail = true;
+    const remoteRpc = createSyncServer(remoteDb, {
+      afterApply: () => {
+        if (fail) throw new Error("disk full");
+      },
+    });
+    try {
+      seed(local.db, 8);
+      // The sender advances its cursor on the acknowledgment and the
+      // caller spawns a command on it, so an unflushed pack must not
+      // acknowledge.
+      await expect(drain(pushBlocks(local.db, remoteRpc, PACK_OPTIONS))).rejects.toThrow(
+        "disk full",
+      );
+
+      // Once the shim recovers the same block replays and completes.
+      fail = false;
+      await drain(pushBlocks(local.db, remoteRpc, PACK_OPTIONS));
+      expect(names(remoteDb)).toHaveLength(8);
+    } finally {
+      local.close();
+      storage.close();
+    }
+  });
+
+  it("does not settle the shim when a pack push carries no entries", async () => {
+    const local = makePeer();
+    const storage = new SQLiteTestStorage();
+    const remoteDb = new Database(storage);
+    initializeSchema(remoteDb, () => 1000);
+    let calls = 0;
+    const remoteRpc = createSyncServer(remoteDb, {
+      afterApply: () => {
+        calls += 1;
+      },
+    });
+    try {
+      // Nothing written locally, so no block carries entries.
+      await drain(pushBlocks(local.db, remoteRpc, PACK_OPTIONS));
+      expect(calls).toBe(0);
+    } finally {
+      local.close();
+      storage.close();
+    }
+  });
+});
+
+describe("deletes across independent peer revision spaces", () => {
+  for (const mode of ["entries", "pack"] as const) {
+    const options = {
+      thresholdEntries: mode === "pack" ? 1 : 1_000,
+      thresholdBytes: 1024 * 1024 * 1024,
+    };
+
+    it(`${mode}: pulls container deletes after pushing a higher local revision`, async () => {
+      const local = makePeer();
+      const remote = makePeer();
+      try {
+        const host = new SQLiteWorkspaceProvider(local.db);
+        const container = new SQLiteWorkspaceProvider(remote.db);
+        for (let i = 0; i < 20; i++) host.writeFileSync("/x", `version ${i}`);
+        host.writeFileSync("/y", "content");
+        await drain(pushBlocks(local.db, remote.rpc, { ...options, backend: "linux" }));
+        container.unlinkSync("/x");
+        container.unlinkSync("/y");
+        const seen = await drain(
+          pullBlocks(local.db, remote.rpc, { ...options, backend: "linux" }),
+        );
+        expect(seen[0].mode).toBe(mode);
+        expect(names(local.db)).toEqual([]);
+      } finally {
+        local.close();
+        remote.close();
+      }
+    });
+
+    it(`${mode}: a container delete wins over a pulled file awaiting its echo push`, async () => {
+      const local = makePeer();
+      const remote = makePeer();
+      try {
+        const container = new SQLiteWorkspaceProvider(remote.db);
+        container.writeFileSync("/x", "content");
+        container.writeFileSync("/y", "content");
+        await drain(pullBlocks(local.db, remote.rpc, { ...options, backend: "linux" }));
+        expect(names(local.db)).toEqual(["x", "y"]);
+        container.unlinkSync("/x");
+        container.unlinkSync("/y");
+        await drain(pullBlocks(local.db, remote.rpc, { ...options, backend: "linux" }));
+        expect(names(local.db)).toEqual([]);
+        await drain(pushBlocks(local.db, remote.rpc, { ...options, backend: "linux" }));
+        expect(names(remote.db)).toEqual([]);
+      } finally {
+        local.close();
+        remote.close();
+      }
+    });
+
+    it(`${mode}: a committed delete replay preserves a receiver recreation`, async () => {
+      const sender = makePeer();
+      const receiver = makePeer();
+      try {
+        const source = new SQLiteWorkspaceProvider(sender.db);
+        const target = new SQLiteWorkspaceProvider(receiver.db);
+        source.writeFileSync("/x", "original");
+        source.writeFileSync("/y", "original");
+        await drain(pushBlocks(sender.db, receiver.rpc, options));
+        source.unlinkSync("/x");
+        source.unlinkSync("/y");
+        const failing = createSyncServer(receiver.db, {
+          afterApply: () => {
+            throw new Error("settle failed after commit");
+          },
+        });
+        await expect(drain(pushBlocks(sender.db, failing, options))).rejects.toThrow(
+          "settle failed",
+        );
+        expect(names(receiver.db)).toEqual([]);
+        target.writeFileSync("/x", "recreated");
+        await drain(pushBlocks(sender.db, receiver.rpc, options));
+        expect(target.readFileSync("/x", "utf8")).toBe("recreated");
+      } finally {
+        sender.close();
+        receiver.close();
+      }
+    });
+
+    it(`${mode}: pushes deletes to a receiver whose local revision is higher`, async () => {
+      const sender = makePeer();
+      const receiver = makePeer();
+      try {
+        const source = new SQLiteWorkspaceProvider(sender.db);
+        const target = new SQLiteWorkspaceProvider(receiver.db);
+        for (let i = 0; i < 20; i++) target.writeFileSync("/unrelated", `version ${i}`);
+        source.writeFileSync("/x", "content");
+        source.writeFileSync("/y", "content");
+        await drain(pushBlocks(sender.db, receiver.rpc, options));
+        source.unlinkSync("/x");
+        source.unlinkSync("/y");
+        const seen = await drain(pushBlocks(sender.db, receiver.rpc, options));
+        expect(seen[0].mode).toBe(mode);
+        expect(names(receiver.db)).toEqual(["unrelated"]);
+      } finally {
+        sender.close();
+        receiver.close();
+      }
+    });
+  }
+});
+
+// A pull mints local revs for what it applies. When nothing local was
+// unpushed before the pull and nothing local was written during it,
+// those revs hold only what the backend sent. The puller acknowledges
+// them with an empty push, so the push cursor covers them: a later
+// delete from the backend wins, and the next push re-sends nothing.
+describe("acknowledging pulled versions", () => {
+  for (const mode of ["entries", "pack"] as const) {
+    const options = {
+      backend: "linux",
+      thresholdEntries: mode === "pack" ? 1 : 1_000,
+      thresholdBytes: 1024 * 1024 * 1024,
+    };
+
+    it(`${mode}: the next push re-sends nothing after a clean pull`, async () => {
+      const local = makePeer();
+      const remote = makePeer();
+      try {
+        const container = new SQLiteWorkspaceProvider(remote.db);
+        container.writeFileSync("/a", "a");
+        container.writeFileSync("/b", "b");
+        container.writeFileSync("/c", "c");
+        const pulled = await drain(pullBlocks(local.db, remote.rpc, options));
+        expect(pulled[0].mode).toBe(mode);
+        expect(readPushCursor(local.db, "linux")).toEqual({
+          rev: currentRev(local.db),
+          path: null,
+        });
+
+        const pushed = await drain(pushBlocks(local.db, remote.rpc, options));
+        expect(pushed.reduce((n, p) => n + p.entries, 0)).toBe(0);
+      } finally {
+        local.close();
+        remote.close();
+      }
+    });
+
+    // pullBlocks does not check for divergence itself; reconcileWatermarks
+    // does, on connect, by comparing the container's fetch cursor with
+    // ours. An acknowledgment sent to a container that restarted empty
+    // would raise that fetch cursor over files it never received, hiding
+    // the restart for good. It is sent only when the container already
+    // confirms our push cursor.
+    it(`${mode}: an acknowledgment never hides a container that restarted empty`, async () => {
+      const local = makePeer();
+      const before = makePeer();
+      const restarted = makePeer();
+      try {
+        const host = new SQLiteWorkspaceProvider(local.db);
+        host.writeFileSync("/x", "host file");
+        await drain(pushBlocks(local.db, before.rpc, options));
+
+        const container = new SQLiteWorkspaceProvider(restarted.db);
+        container.writeFileSync("/y", "made after the restart");
+        await drain(pullBlocks(local.db, restarted.rpc, options));
+        expect(readFetchCursor(restarted.db)).toEqual({ rev: 0, path: null });
+
+        expect((await reconcileWatermarks(local.db, restarted.rpc, "linux")).pushRevReset).toBe(
+          true,
+        );
+        await drain(pushBlocks(local.db, restarted.rpc, options));
+        expect(names(restarted.db)).toEqual(["x", "y"]);
+      } finally {
+        local.close();
+        before.close();
+        restarted.close();
+      }
+    });
+
+    it(`${mode}: unpushed host work blocks the acknowledgment and still ships`, async () => {
+      const local = makePeer();
+      const remote = makePeer();
+      try {
+        const host = new SQLiteWorkspaceProvider(local.db);
+        const container = new SQLiteWorkspaceProvider(remote.db);
+        host.writeFileSync("/local", "unpushed");
+        container.writeFileSync("/x", "x");
+        await drain(pullBlocks(local.db, remote.rpc, options));
+        expect(readPushCursor(local.db, "linux").rev).toBeLessThan(currentRev(local.db));
+
+        await drain(pushBlocks(local.db, remote.rpc, options));
+        expect(container.readFileSync("/local", "utf8")).toBe("unpushed");
+      } finally {
+        local.close();
+        remote.close();
+      }
+    });
+
+    // Without the acknowledgment the pulled copy looks like unpushed
+    // host work. The container's tombstone carries the fingerprint of
+    // the version it removed, which is exactly what the host holds, so
+    // the delete applies anyway and nothing comes back on the next push.
+    it(`${mode}: a fingerprinted delete removes a pulled file the pull could not acknowledge`, async () => {
+      const local = makePeer();
+      const remote = makePeer();
+      try {
+        const host = new SQLiteWorkspaceProvider(local.db);
+        const container = new SQLiteWorkspaceProvider(remote.db);
+        host.writeFileSync("/local", "unpushed");
+        container.writeFileSync("/x", "x");
+        await drain(pullBlocks(local.db, remote.rpc, options));
+        container.unlinkSync("/x");
+        await drain(pullBlocks(local.db, remote.rpc, options));
+        expect(names(local.db)).toEqual(["local"]);
+
+        await drain(pushBlocks(local.db, remote.rpc, options));
+        expect(names(remote.db)).toEqual(["local"]);
+      } finally {
+        local.close();
+        remote.close();
+      }
+    });
+  }
+});
