@@ -1,6 +1,6 @@
 # Cloudflare Computer
 
-Cloudflare Computer is a virtual filesystem that lives inside a
+Cloudflare Computer is a virtual filesystem that lives inside a 67
 Durable Object. The Durable Object holds the authoritative state in
 SQLite and exposes one pluggable execution surface through
 `workspace.runtime`. Three backends ship today:
